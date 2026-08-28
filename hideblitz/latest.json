@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "product": "HideBlitz",
+  "latest": {
+    "version": "0.9.0",
+    "filename": "HideBlitz-v0.9.0.exe",
+    "url": "https://raw.githubusercontent.com/Vova101/botpro2/main/hideblitz/releases/HideBlitz-v0.9.0.exe",
+    "sha256": "0d2c0fed863c15d925bcd255033c024fe0b464b1f3b34266617c8377635bd843",
+    "size": 17021440
+  },
+  "minimumVersion": "0.9.0",
+  "required": false,
+  "builds": {
+    "0.9.0": {
+      "filename": "HideBlitz-v0.9.0.exe",
+      "url": "https://raw.githubusercontent.com/Vova101/botpro2/main/hideblitz/releases/HideBlitz-v0.9.0.exe",
+      "sha256": "0d2c0fed863c15d925bcd255033c024fe0b464b1f3b34266617c8377635bd843",
+      "size": 17021440
+    }
+  }
+}
