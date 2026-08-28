@@ -1,4 +1,5 @@
 {
   "minimumVersion": "0.9.0",
-  "required": false
+  "required": false,
+  "channel": "stable"
 }
