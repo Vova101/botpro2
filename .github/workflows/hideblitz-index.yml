@@ -1,4 +1,4 @@
-name: Build HideBlitz update index
+name: Build HideBlitz signed update index
 
 on:
   push:
@@ -14,91 +14,126 @@ permissions:
 jobs:
   index:
     runs-on: ubuntu-latest
+    env:
+      HIDEBLITZ_UPDATE_PRIVATE_KEY: ${{ secrets.HIDEBLITZ_UPDATE_PRIVATE_KEY }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Generate latest.json
+      - name: Check signing key
+        id: key
+        shell: bash
+        run: |
+          if [ -n "$HIDEBLITZ_UPDATE_PRIVATE_KEY" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::HIDEBLITZ_UPDATE_PRIVATE_KEY is not configured. Existing signed latest.json will be kept unchanged."
+          fi
+
+      - name: Install signing dependency
+        if: steps.key.outputs.available == 'true'
+        run: python3 -m pip install --quiet cryptography
+
+      - name: Generate signed latest.json
+        if: steps.key.outputs.available == 'true'
         shell: bash
         run: |
           python3 - <<'PY'
+          import base64
           import hashlib
           import json
+          import os
           import re
           from pathlib import Path
           from urllib.parse import quote
+          from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
           owner = "Vova101"
           repo = "botpro2"
+          key_id = "hideblitz-prod-1"
           root = Path("hideblitz")
           releases = root / "releases"
           latest_path = root / "latest.json"
           policy_path = root / "policy.json"
           releases.mkdir(parents=True, exist_ok=True)
 
-          old = {}
+          builds = {}
           if latest_path.exists():
               try:
                   old = json.loads(latest_path.read_text(encoding="utf-8"))
-              except Exception:
-                  old = {}
-          builds = dict(old.get("builds") or {})
+                  if old.get("schema") == 2 and old.get("payload"):
+                      old_payload = json.loads(base64.b64decode(old["payload"]).decode("utf-8"))
+                      builds.update(old_payload.get("builds") or {})
+                  else:
+                      builds.update(old.get("builds") or {})
+              except Exception as exc:
+                  print(f"Ignoring unreadable previous manifest: {exc}")
 
           pattern = re.compile(r"^HideBlitz-v(\d+\.\d+\.\d+)\.exe$", re.I)
           for path in releases.glob("*.exe"):
-              m = pattern.match(path.name)
-              if not m:
+              match = pattern.match(path.name)
+              if not match:
                   continue
-              version = m.group(1)
+              version = match.group(1)
               data = path.read_bytes()
-              sha = hashlib.sha256(data).hexdigest()
-              url = f"https://raw.githubusercontent.com/{owner}/{repo}/main/hideblitz/releases/{quote(path.name)}"
               builds[version] = {
                   "filename": path.name,
-                  "url": url,
-                  "sha256": sha,
+                  "url": f"https://raw.githubusercontent.com/{owner}/{repo}/main/hideblitz/releases/{quote(path.name)}",
+                  "sha256": hashlib.sha256(data).hexdigest(),
                   "size": len(data),
               }
 
-          def version_key(v):
+          def version_key(value):
               try:
-                  return tuple(int(x) for x in v.split("."))
+                  parts = tuple(int(x) for x in value.split("."))
+                  return parts if len(parts) == 3 else (-1, -1, -1)
               except Exception:
                   return (-1, -1, -1)
 
           valid = [v for v in builds if version_key(v) != (-1, -1, -1)]
           if not valid:
-              raise SystemExit("No HideBlitz builds registered. Seed hideblitz/latest.json or upload a release EXE first.")
+              raise SystemExit("No registered HideBlitz builds. Upload an EXE or seed a signed manifest first.")
           latest_version = max(valid, key=version_key)
           latest = builds[latest_version]
 
-          policy = {"minimumVersion": "0.9.0", "required": False}
+          policy = {"minimumVersion": "0.9.0", "required": False, "notes": ""}
           if policy_path.exists():
               policy.update(json.loads(policy_path.read_text(encoding="utf-8")))
 
-          payload = {
-              "schema": 1,
-              "product": "HideBlitz",
-              "latest": {
-                  "version": latest_version,
-                  **latest,
-              },
-              "minimumVersion": str(policy.get("minimumVersion") or "0.9.0"),
+          payload_obj = {
+              "latest": {"version": latest_version, **latest},
+              "minimumVersion": str(policy.get("minimumVersion") or latest_version),
               "required": bool(policy.get("required", False)),
+              "notes": str(policy.get("notes") or ""),
               "builds": dict(sorted(builds.items(), key=lambda kv: version_key(kv[0]))),
           }
-          latest_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-          print(json.dumps(payload["latest"], indent=2))
+          payload = json.dumps(payload_obj, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+          seed = base64.b64decode(os.environ["HIDEBLITZ_UPDATE_PRIVATE_KEY"].strip())
+          if len(seed) != 32:
+              raise SystemExit("HIDEBLITZ_UPDATE_PRIVATE_KEY must be base64 of a raw 32-byte Ed25519 seed")
+          signature = Ed25519PrivateKey.from_private_bytes(seed).sign(payload)
+          envelope = {
+              "schema": 2,
+              "product": "HideBlitz",
+              "keyId": key_id,
+              "payload": base64.b64encode(payload).decode("ascii"),
+              "signature": base64.b64encode(signature).decode("ascii"),
+          }
+          latest_path.write_text(json.dumps(envelope, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+          print(f"signed version={latest_version} sha256={latest['sha256']} size={latest['size']}")
           PY
 
-      - name: Commit index
+      - name: Commit signed index
+        if: steps.key.outputs.available == 'true'
         shell: bash
         run: |
           git config user.name "hideblitz-update-bot"
           git config user.email "actions@users.noreply.github.com"
           git add hideblitz/latest.json
           if git diff --cached --quiet; then
-            echo "latest.json is already current"
+            echo "Signed latest.json is already current"
           else
-            git commit -m "Update HideBlitz release index [skip ci]"
+            git commit -m "Update signed HideBlitz release index [skip ci]"
             git push
           fi
