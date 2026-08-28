@@ -75,6 +75,12 @@ jobs:
               if not match:
                   continue
               version = match.group(1)
+              # Published versions are immutable. Once a build hash is registered
+              # in the signed manifest, replacing a file with the same version must
+              # never silently change what existing clients trust.
+              if version in builds:
+                  print(f"Keeping immutable registered build {version}")
+                  continue
               data = path.read_bytes()
               builds[version] = {
                   "filename": path.name,
