@@ -1,20 +1,16 @@
-# HideBlitz releases
+# HideBlitz release storage
 
-HideBlitz binaries are distributed through **GitHub Releases**, not through Git history.
+Do **not** commit HideBlitz EXE files to this directory anymore.
 
-## Normal release flow (0.9.4 and newer)
+Official binaries live only in GitHub Releases as the asset `HideBlitz.exe`. The signed `latest.json` is published beside the EXE in the same Release.
 
-1. Build `HideBlitz.exe` locally from the private HideBlitz repository.
-2. Create a public GitHub Release in `Vova101/botpro2` with tag `hideblitz-vMAJOR.MINOR.PATCH`.
-3. Upload exactly one asset named `HideBlitz.exe` and publish the Release.
-4. The public workflow hashes the EXE, signs `latest.json` with the repository secret, attaches `latest.json` to the Release, and keeps only the tiny signed compatibility index in Git.
+Normal release flow is local from the private HideBlitz repository:
 
-Do **not** commit normal future EXE files into this folder.
+```powershell
+.\scripts\build-windows.ps1
+.\scripts\publish-release.ps1
+```
 
-## One-time 0.9.3 compatibility bridge
+`publish-release.ps1` signs `latest.json` locally with the owner's Ed25519 key, creates the GitHub Release as a draft, uploads both `HideBlitz.exe` and `latest.json`, and only then publishes the Release. This prevents clients from observing a half-published update and avoids automatic GitHub Actions usage.
 
-Clients up to 0.9.2 only accept `raw.githubusercontent.com` update binaries. Therefore `HideBlitz-v0.9.3.exe` is the final binary that must also be committed to this folder. The workflow will publish the same bytes as the user-facing `HideBlitz.exe` Release asset. Once users can run 0.9.3, all later binaries can live only in GitHub Releases.
-
-Clients never trust a file only because it exists on GitHub. They verify the Ed25519-signed manifest and then verify the downloaded EXE size and SHA-256.
-
-Never store the HideBlitz Ed25519 private signing key in the repository.
+The workflow in `.github/workflows/hideblitz-index.yml` is manual recovery only.
