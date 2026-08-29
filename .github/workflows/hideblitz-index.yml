@@ -6,6 +6,7 @@ on:
     paths:
       - 'hideblitz/releases/**'
       - 'hideblitz/policy.json'
+      - '.github/workflows/hideblitz-index.yml'
   workflow_dispatch:
 
 permissions:
@@ -143,3 +144,29 @@ jobs:
             git commit -m "Update signed HideBlitz release index [skip ci]"
             git push
           fi
+
+      - name: Publish first-download release
+        if: steps.key.outputs.available == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          latest_file="$(find hideblitz/releases -maxdepth 1 -type f -name 'HideBlitz-v*.exe' -print | sort -V | tail -n 1)"
+          if [ -z "$latest_file" ]; then
+            echo "No HideBlitz release EXE found"
+            exit 1
+          fi
+          filename="$(basename "$latest_file")"
+          version="$(printf '%s' "$filename" | sed -E 's/^HideBlitz-v([0-9]+\.[0-9]+\.[0-9]+)\.exe$/\1/')"
+          if [ "$version" = "$filename" ]; then
+            echo "Cannot parse version from $filename"
+            exit 1
+          fi
+          tag="hideblitz-v${version}"
+          cp "$latest_file" HideBlitz.exe
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" HideBlitz.exe --clobber
+          else
+            gh release create "$tag" HideBlitz.exe --title "HideBlitz ${version}" --notes "Официальная portable-сборка HideBlitz. Для первого запуска скачайте HideBlitz.exe; дальнейшие обновления устанавливаются из клиента."
+          fi
+          echo "Permanent first-download URL: https://github.com/Vova101/botpro2/releases/latest/download/HideBlitz.exe"
