@@ -1,8 +1,10 @@
-name: Build HideBlitz signed update index
+name: Publish signed HideBlitz release metadata
 
 on:
+  release:
+    types: [published]
   push:
-    branches: [ main ]
+    branches: [main]
     paths:
       - 'hideblitz/releases/**'
       - 'hideblitz/policy.json'
@@ -13,38 +15,117 @@ permissions:
   contents: write
 
 jobs:
-  index:
+  publish:
     runs-on: ubuntu-latest
     env:
       HIDEBLITZ_UPDATE_PRIVATE_KEY: ${{ secrets.HIDEBLITZ_UPDATE_PRIVATE_KEY }}
+      GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout metadata repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
 
       - name: Check signing key
-        id: key
         shell: bash
         run: |
-          if [ -n "$HIDEBLITZ_UPDATE_PRIVATE_KEY" ]; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::HIDEBLITZ_UPDATE_PRIVATE_KEY is not configured. Existing signed latest.json will be kept unchanged."
+          if [ -z "$HIDEBLITZ_UPDATE_PRIVATE_KEY" ]; then
+            echo "HIDEBLITZ_UPDATE_PRIVATE_KEY is not configured"
+            exit 1
           fi
 
       - name: Install signing dependency
-        if: steps.key.outputs.available == 'true'
         run: python3 -m pip install --quiet cryptography
 
-      - name: Generate signed latest.json
-        if: steps.key.outputs.available == 'true'
+      - name: Resolve official EXE and release
+        id: source
         shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .hideblitz-work
+          mode="release"
+          legacy_path=""
+          tag=""
+
+          if [ "${{ github.event_name }}" = "release" ]; then
+            tag='${{ github.event.release.tag_name }}'
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            legacy_path="$(jq -r '[.commits[]? | (.added[]?, .modified[]?)] | .[]' "$GITHUB_EVENT_PATH" 2>/dev/null | grep -E '^hideblitz/releases/HideBlitz-v[0-9]+\.[0-9]+\.[0-9]+\.exe$' | tail -n 1 || true)"
+            if [ -n "$legacy_path" ] && [ -f "$legacy_path" ]; then
+              mode="legacy"
+              filename="$(basename "$legacy_path")"
+              version="$(printf '%s' "$filename" | sed -E 's/^HideBlitz-v([0-9]+\.[0-9]+\.[0-9]+)\.exe$/\1/')"
+              tag="hideblitz-v${version}"
+              cp "$legacy_path" .hideblitz-work/HideBlitz.exe
+
+              if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+                rm -f .hideblitz-work/existing.exe
+                gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern HideBlitz.exe --dir .hideblitz-work/existing >/dev/null 2>&1 || true
+                if [ -f .hideblitz-work/existing/HideBlitz.exe ]; then
+                  old_hash="$(sha256sum .hideblitz-work/existing/HideBlitz.exe | awk '{print $1}')"
+                  new_hash="$(sha256sum .hideblitz-work/HideBlitz.exe | awk '{print $1}')"
+                  if [ "$old_hash" != "$new_hash" ]; then
+                    echo "Release $tag already exists with different HideBlitz.exe bytes"
+                    exit 1
+                  fi
+                else
+                  gh release upload "$tag" .hideblitz-work/HideBlitz.exe --repo "$GITHUB_REPOSITORY"
+                fi
+              else
+                gh release create "$tag" .hideblitz-work/HideBlitz.exe --repo "$GITHUB_REPOSITORY" --title "HideBlitz ${version}" --notes "Официальная portable-сборка HideBlitz. Скачайте HideBlitz.exe; дальнейшие обновления устанавливаются из приложения."
+              fi
+            fi
+          fi
+
+          if [ -z "$tag" ]; then
+            tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)"
+          fi
+          if [ -z "$tag" ]; then
+            echo "No published HideBlitz release found"
+            exit 1
+          fi
+
+          version="$(printf '%s' "$tag" | sed -E 's/^hideblitz-v([0-9]+\.[0-9]+\.[0-9]+)$/\1/')"
+          if [ "$version" = "$tag" ]; then
+            echo "Release tag must be hideblitz-vMAJOR.MINOR.PATCH, got: $tag"
+            exit 1
+          fi
+
+          if [ "$mode" != "legacy" ]; then
+            rm -rf .hideblitz-work/release
+            mkdir -p .hideblitz-work/release
+            gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern HideBlitz.exe --dir .hideblitz-work/release
+            cp .hideblitz-work/release/HideBlitz.exe .hideblitz-work/HideBlitz.exe
+          fi
+
+          if [ ! -s .hideblitz-work/HideBlitz.exe ]; then
+            echo "Release $tag does not contain HideBlitz.exe"
+            exit 1
+          fi
+          if [ "$(head -c 2 .hideblitz-work/HideBlitz.exe)" != "MZ" ]; then
+            echo "HideBlitz.exe is not a Windows PE executable"
+            exit 1
+          fi
+
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "legacy_path=$legacy_path" >> "$GITHUB_OUTPUT"
+          echo "Resolved $mode source: $tag"
+
+      - name: Generate signed latest.json
+        shell: bash
+        env:
+          HB_MODE: ${{ steps.source.outputs.mode }}
+          HB_TAG: ${{ steps.source.outputs.tag }}
+          HB_VERSION: ${{ steps.source.outputs.version }}
+          HB_LEGACY_PATH: ${{ steps.source.outputs.legacy_path }}
         run: |
           python3 - <<'PY'
           import base64
           import hashlib
           import json
           import os
-          import re
           from pathlib import Path
           from urllib.parse import quote
           from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -53,10 +134,17 @@ jobs:
           repo = "botpro2"
           key_id = "hideblitz-prod-1"
           root = Path("hideblitz")
-          releases = root / "releases"
           latest_path = root / "latest.json"
           policy_path = root / "policy.json"
-          releases.mkdir(parents=True, exist_ok=True)
+          exe_path = Path(".hideblitz-work/HideBlitz.exe")
+          version = os.environ["HB_VERSION"].strip()
+          tag = os.environ["HB_TAG"].strip()
+          mode = os.environ["HB_MODE"].strip()
+          legacy_path = os.environ.get("HB_LEGACY_PATH", "").strip()
+
+          data = exe_path.read_bytes()
+          digest = hashlib.sha256(data).hexdigest()
+          size = len(data)
 
           builds = {}
           if latest_path.exists():
@@ -65,30 +153,28 @@ jobs:
                   if old.get("schema") == 2 and old.get("payload"):
                       old_payload = json.loads(base64.b64decode(old["payload"]).decode("utf-8"))
                       builds.update(old_payload.get("builds") or {})
-                  else:
-                      builds.update(old.get("builds") or {})
               except Exception as exc:
                   print(f"Ignoring unreadable previous manifest: {exc}")
 
-          pattern = re.compile(r"^HideBlitz-v(\d+\.\d+\.\d+)\.exe$", re.I)
-          for path in releases.glob("*.exe"):
-              match = pattern.match(path.name)
-              if not match:
-                  continue
-              version = match.group(1)
-              # Published versions are immutable. Once a build hash is registered
-              # in the signed manifest, replacing a file with the same version must
-              # never silently change what existing clients trust.
-              if version in builds:
-                  print(f"Keeping immutable registered build {version}")
-                  continue
-              data = path.read_bytes()
-              builds[version] = {
-                  "filename": path.name,
-                  "url": f"https://raw.githubusercontent.com/{owner}/{repo}/main/hideblitz/releases/{quote(path.name)}",
-                  "sha256": hashlib.sha256(data).hexdigest(),
-                  "size": len(data),
-              }
+          existing = builds.get(version)
+          if existing:
+              old_hash = str(existing.get("sha256") or "").lower()
+              if old_hash and old_hash != digest:
+                  raise SystemExit(f"Version {version} is immutable: registered {old_hash}, got {digest}")
+
+          if mode == "legacy" and legacy_path:
+              download_url = f"https://raw.githubusercontent.com/{owner}/{repo}/main/{quote(legacy_path, safe='/')}"
+              filename = Path(legacy_path).name
+          else:
+              download_url = f"https://github.com/{owner}/{repo}/releases/download/{quote(tag, safe='')}/HideBlitz.exe"
+              filename = "HideBlitz.exe"
+
+          builds[version] = {
+              "filename": filename,
+              "url": download_url,
+              "sha256": digest,
+              "size": size,
+          }
 
           def version_key(value):
               try:
@@ -99,7 +185,7 @@ jobs:
 
           valid = [v for v in builds if version_key(v) != (-1, -1, -1)]
           if not valid:
-              raise SystemExit("No registered HideBlitz builds. Upload an EXE or seed a signed manifest first.")
+              raise SystemExit("No registered HideBlitz builds")
           latest_version = max(valid, key=version_key)
           latest = builds[latest_version]
 
@@ -128,11 +214,10 @@ jobs:
               "signature": base64.b64encode(signature).decode("ascii"),
           }
           latest_path.write_text(json.dumps(envelope, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-          print(f"signed version={latest_version} sha256={latest['sha256']} size={latest['size']}")
+          print(f"signed latest={latest_version} current={version} sha256={digest} size={size} mode={mode}")
           PY
 
-      - name: Commit signed index
-        if: steps.key.outputs.available == 'true'
+      - name: Keep tiny compatibility index on main
         shell: bash
         run: |
           git config user.name "hideblitz-update-bot"
@@ -145,28 +230,9 @@ jobs:
             git push
           fi
 
-      - name: Publish first-download release
-        if: steps.key.outputs.available == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Attach signed manifest to GitHub Release
         shell: bash
         run: |
-          latest_file="$(find hideblitz/releases -maxdepth 1 -type f -name 'HideBlitz-v*.exe' -print | sort -V | tail -n 1)"
-          if [ -z "$latest_file" ]; then
-            echo "No HideBlitz release EXE found"
-            exit 1
-          fi
-          filename="$(basename "$latest_file")"
-          version="$(printf '%s' "$filename" | sed -E 's/^HideBlitz-v([0-9]+\.[0-9]+\.[0-9]+)\.exe$/\1/')"
-          if [ "$version" = "$filename" ]; then
-            echo "Cannot parse version from $filename"
-            exit 1
-          fi
-          tag="hideblitz-v${version}"
-          cp "$latest_file" HideBlitz.exe
-          if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" HideBlitz.exe --clobber
-          else
-            gh release create "$tag" HideBlitz.exe --title "HideBlitz ${version}" --notes "Официальная portable-сборка HideBlitz. Для первого запуска скачайте HideBlitz.exe; дальнейшие обновления устанавливаются из клиента."
-          fi
-          echo "Permanent first-download URL: https://github.com/Vova101/botpro2/releases/latest/download/HideBlitz.exe"
+          gh release upload '${{ steps.source.outputs.tag }}' hideblitz/latest.json --repo "$GITHUB_REPOSITORY" --clobber
+          echo "First-download asset: https://github.com/Vova101/botpro2/releases/latest/download/HideBlitz.exe"
+          echo "Manifest asset: https://github.com/Vova101/botpro2/releases/latest/download/latest.json"
