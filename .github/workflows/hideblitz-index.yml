@@ -2,6 +2,11 @@ name: Manual HideBlitz signed-manifest recovery
 
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Draft HideBlitz release tag to sign
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -26,23 +31,33 @@ jobs:
       - name: Install signing dependency
         run: python3 -m pip install --quiet cryptography
 
-      - name: Recover latest signed manifest
+      - name: Sign a complete draft release
         shell: bash
         run: |
           set -euo pipefail
-          tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)"
+          tag="${{ inputs.tag }}"
           version="$(printf '%s' "$tag" | sed -E 's/^hideblitz-v([0-9]+\.[0-9]+\.[0-9]+)$/\1/')"
           if [ "$version" = "$tag" ]; then
-            echo "Latest release tag is not a HideBlitz version: $tag"
+            echo "Requested tag is not a HideBlitz version: $tag"
             exit 1
           fi
-          rm -rf .hideblitz-recovery
-          mkdir -p .hideblitz-recovery
+          is_draft="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft -q .isDraft)"
+          if [ "$is_draft" != "true" ]; then
+            echo "Refusing to modify a published release: $tag"
+            exit 1
+          fi
+
+          rm -rf .hideblitz-recovery .hideblitz-previous
+          mkdir -p .hideblitz-recovery .hideblitz-previous
           gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern HideBlitz.exe --dir .hideblitz-recovery
+
+          previous_tag="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)"
+          gh release download "$previous_tag" --repo "$GITHUB_REPOSITORY" --pattern latest.json --dir .hideblitz-previous
+          cp .hideblitz-previous/latest.json hideblitz/latest.json
+
           python3 hideblitz/sign_release.py --exe .hideblitz-recovery/HideBlitz.exe --version "$version" --tag "$tag"
           gh release upload "$tag" hideblitz/latest.json --repo "$GITHUB_REPOSITORY" --clobber
-          echo "Recovered signed latest.json for $tag"
+          echo "Signed latest.json uploaded to draft $tag"
 
-# Normal HideBlitz releases are built and signed locally with
-# HideBlitz/scripts/publish-release.ps1. This workflow never runs automatically,
-# so normal publishing consumes no GitHub Actions minutes or artifact storage.
+# Normal HideBlitz releases are built locally. This workflow signs a selected
+# draft with the repository secret so the draft can be verified before publish.
